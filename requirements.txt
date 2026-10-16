@@ -1,0 +1,14 @@
+numpy
+pandas
+matplotlib
+requests
+psutil
+torch
+transformers
+sentence-transformers
+datasets
+faiss-cpu
+rank_bm25
+ipykernel
+nbformat
+nbclient
