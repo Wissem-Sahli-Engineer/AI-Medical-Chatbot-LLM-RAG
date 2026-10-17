@@ -44,6 +44,7 @@ Online:   user message
 
 | File | Content |
 | --- | --- |
+| `Project_Report.pdf` | Full project report (19 pages): problem, state of the art, data, methodology, results, critical analysis, limitations, references |
 | `medical_chatbot_rag.ipynb` | The whole project, executed with its results: introduction, state of the art, data, methodology, implementation, experiments, critical analysis, limitations, references |
 | `requirements.txt` | Python dependencies |
 | `methodologie.txt` | Outline of the report |
