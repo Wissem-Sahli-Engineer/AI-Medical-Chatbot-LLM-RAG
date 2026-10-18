@@ -5,11 +5,11 @@ export async function getHealth() {
 }
 
 // Streams the chatbot's answer: the backend sends one JSON event per line (NDJSON).
-export async function streamChat(message, onEvent, signal) {
+export async function streamChat(payload, onEvent, signal) {
   const r = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify(payload),
     signal,
   })
   if (!r.ok) {

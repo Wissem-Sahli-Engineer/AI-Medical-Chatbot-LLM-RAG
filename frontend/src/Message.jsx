@@ -1,15 +1,53 @@
 import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { AlertIcon, BookIcon, CheckIcon, ChevronIcon, CopyIcon, ExternalIcon, Logo } from './icons.jsx'
+import {
+  AlertIcon, BookIcon, BrainIcon, CheckIcon, ChevronIcon, CopyIcon, ExternalIcon, FileIcon, Logo, RefreshIcon, ShieldIcon,
+} from './icons.jsx'
 
-const STATUS_TEXT = {
-  routing: 'Checking your message…',
-  searching: 'Searching medical sources…',
-  writing: 'Writing the answer…',
+// Turn "[2]" or "[1, 2]" citations into links that the renderer shows as small numbered chips.
+// A reply that starts with "4. ..." (an answer, not a list) must not render as a numbered list.
+const withCitations = (text) =>
+  text.replace(/^([2-9]|\d{2,})\.(\s)/, '$1\\.$2').replace(/\[(\d+(?:\s*,\s*\d+)*)\]/g, (_, nums) => nums.split(/\s*,\s*/).map((n) => `[${n}](#cite-${n})`).join(''))
+
+const SOURCE_LABEL = { PubMedQA: 'PubMed', MedQuAD: 'NIH · MedQuAD', 'Your file': 'Your file' }
+const SOURCE_CLASS = { PubMedQA: 'pubmed', MedQuAD: 'nih', 'Your file': 'file' }
+
+function Process({ steps, reasoning, busy, writing }) {
+  const [open, setOpen] = useState(null) // null = automatic: open while reasoning streams
+  const expanded = open ?? (busy && !writing && !!reasoning)
+  const current = steps.at(-1)
+  return (
+    <div className={`process ${expanded ? 'open' : ''}`}>
+      <button className="process-head" onClick={() => setOpen(!expanded)}>
+        {busy && !writing ? <span className="spinner" /> : <BrainIcon />}
+        <span>
+          {busy && !writing
+            ? (reasoning ? 'Reasoning…' : `${current?.label ?? 'Starting'}…`)
+            : `Process · ${steps.length} step${steps.length > 1 ? 's' : ''}${reasoning ? ' + reasoning' : ''}`}
+        </span>
+        <ChevronIcon open={expanded} />
+      </button>
+      {expanded && (
+        <div className="process-body">
+          <ol className="steps">
+            {steps.map((s, i) => (
+              <li key={i}>
+                <span className="step-dot" />
+                <div><strong>{s.label}</strong>{s.detail && <span>{s.detail}</span>}</div>
+              </li>
+            ))}
+          </ol>
+          {reasoning && (
+            <div className="reasoning">
+              <div className="reasoning-label"><BrainIcon size={13} /> Model reasoning</div>
+              <p>{reasoning.trim()}</p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
 }
-
-// Turn "[2]" citations into links that the renderer shows as small numbered chips.
-const withCitations = (text) => text.replace(/\[(\d+)\]/g, '[$1](#cite-$1)')
 
 function Sources({ sources, highlight, onToggle, open }) {
   return (
@@ -23,7 +61,7 @@ function Sources({ sources, highlight, onToggle, open }) {
             <li key={s.n} id={`src-${s.n}`} className={highlight === s.n ? 'highlight' : ''}>
               <div className="source-head">
                 <span className="cite static">{s.n}</span>
-                <span className={`badge ${s.source === 'PubMedQA' ? 'pubmed' : 'nih'}`}>{s.source === 'PubMedQA' ? 'PubMed' : 'NIH · MedQuAD'}</span>
+                <span className={`badge ${SOURCE_CLASS[s.source] ?? ''}`}>{SOURCE_LABEL[s.source] ?? s.source}</span>
                 {s.url ? (
                   <a href={s.url} target="_blank" rel="noreferrer" className="source-title">{s.title} <ExternalIcon /></a>
                 ) : (
@@ -39,17 +77,29 @@ function Sources({ sources, highlight, onToggle, open }) {
   )
 }
 
-export default function Message({ message: m }) {
+export default function Message({ message: m, isLast, onRegenerate }) {
   const [sourcesOpen, setSourcesOpen] = useState(false)
   const [highlight, setHighlight] = useState(null)
   const [copied, setCopied] = useState(false)
 
   if (m.role === 'user') {
-    return <div className="msg user"><div className="bubble">{m.content}</div></div>
+    return (
+      <div className="msg user">
+        {m.attachments?.length > 0 && (
+          <div className="user-attachments">
+            {m.attachments.map((a) => a.kind === 'image'
+              ? <img key={a.id} src={a.thumb} alt={a.name} className="user-image" />
+              : <span key={a.id} className="user-file"><FileIcon size={15} /> {a.name}</span>)}
+          </div>
+        )}
+        {m.content && <div className="bubble">{m.content}</div>}
+      </div>
+    )
   }
 
   const category = m.meta?.category
   const busy = m.status && m.status !== 'done'
+  const writing = m.status === 'writing'
 
   const openSource = (n) => {
     setSourcesOpen(true)
@@ -59,7 +109,7 @@ export default function Message({ message: m }) {
 
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(m.content.replace(/\s*\[\d+\]/g, ''))
+      await navigator.clipboard.writeText(m.content.replace(/\s*\[\d+(?:\s*,\s*\d+)*\]/g, ''))
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     } catch { /* clipboard blocked */ }
@@ -84,17 +134,17 @@ export default function Message({ message: m }) {
     <div className="msg assistant">
       <Logo size={28} />
       <div className="body">
-        {busy && !m.content && (
-          <div className="status"><span className="pulse" />{STATUS_TEXT[m.status] ?? 'Thinking…'}</div>
+        {(m.steps?.length > 0 || busy) && (
+          <Process steps={m.steps ?? []} reasoning={m.reasoning} busy={busy} writing={writing} />
         )}
 
         {category === 'emergency' && m.content ? (
           <div className="emergency"><AlertIcon /><div>{markdown}</div></div>
         ) : (
-          m.content && <div className={`markdown ${busy ? 'typing' : ''}`}>{markdown}</div>
+          m.content && <div className={`markdown ${writing ? 'typing' : ''}`}>{markdown}</div>
         )}
 
-        {m.caution && <div className="caution"><AlertIcon size={16} /> {m.caution}</div>}
+        {m.caution && <div className="caution"><ShieldIcon size={15} /> {m.caution}</div>}
         {m.error && <div className="error">Something went wrong: {m.error}</div>}
         {m.stopped && <div className="stopped">Stopped.</div>}
 
@@ -102,12 +152,17 @@ export default function Message({ message: m }) {
           <Sources sources={m.sources} highlight={highlight} open={sourcesOpen} onToggle={() => setSourcesOpen((o) => !o)} />
         )}
 
-        {!busy && m.content && (
+        {!busy && (m.content || m.error || m.stopped) && (
           <div className="msg-foot">
             {m.disclaimer && <span className="disclaimer">{m.disclaimer}</span>}
             <span className="msg-actions">
               {m.latency != null && <span className="latency">{m.latency}s</span>}
-              <button className="icon-btn small" onClick={copy} aria-label="Copy answer">{copied ? <CheckIcon /> : <CopyIcon />}</button>
+              {m.content && (
+                <button className="icon-btn small" onClick={copy} aria-label="Copy answer" title="Copy">{copied ? <CheckIcon /> : <CopyIcon />}</button>
+              )}
+              {isLast && onRegenerate && (
+                <button className="icon-btn small" onClick={onRegenerate} aria-label="Regenerate answer" title="Regenerate"><RefreshIcon /></button>
+              )}
             </span>
           </div>
         )}

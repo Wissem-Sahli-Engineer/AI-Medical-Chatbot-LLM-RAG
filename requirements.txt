@@ -16,3 +16,4 @@ nbclient
 # Interface
 fastapi
 uvicorn[standard]
+pypdf

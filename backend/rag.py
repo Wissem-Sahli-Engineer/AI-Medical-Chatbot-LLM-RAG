@@ -3,6 +3,8 @@
 Dense retrieval (multilingual E5 + FAISS) over PubMedQA abstracts and MedQuAD answers,
 keyword rules + LLM triage as guardrails, MedGemma 1.5 4B (Q4) served by Ollama.
 """
+import base64
+import io
 import json
 import os
 import re
@@ -12,6 +14,7 @@ from pathlib import Path
 import faiss
 import numpy as np
 import pandas as pd
+import pypdf
 import requests
 import torch
 from datasets import load_dataset
@@ -106,6 +109,12 @@ class Retriever:
         return self.model.encode(texts, batch_size=64, normalize_embeddings=True,
                                  convert_to_numpy=True, show_progress_bar=False).astype("float32")
 
+    def encode_passages(self, texts):
+        return self._encode(["passage: " + t for t in texts])
+
+    def encode_query(self, query):
+        return self._encode(["query: " + query])
+
     def search(self, query, k=TOP_K):
         scores, idx = self.index.search(self._encode(["query: " + query]), k)
         return [(int(i), float(s)) for i, s in zip(idx[0], scores[0])]
@@ -115,7 +124,12 @@ class Retriever:
 
 NO_REASONING = "\n\nGive only the final answer. Do not show any reasoning or analysis steps."
 ANSWER_PREFILL = {"fr": "Réponse :", "en": "Answer:"}
+REASONING_PREFILL = "<reasoning>\n"
 TRUNCATE_RE = re.compile(r"\n\s*(\[\d+\]\s|CONTEXT:|QUESTION:)")
+
+
+class ThinkingLeak(Exception):
+    """The model started an internal "thought" block instead of answering."""
 
 
 def gemma_prompt(user_content, prefill=""):
@@ -154,48 +168,91 @@ def generate(user_content, max_tokens=300, prefill="", repeat_penalty=None):
     return text
 
 
-def stream_answer(prompt, lang, max_tokens=300, repeat_penalty=1.15, holdback=12):
-    """Stream a long answer token by token.
+def chat_once(messages, max_tokens=400):
+    """Non-streamed call to the chat endpoint (used for images, which raw mode does not accept)."""
+    r = requests.post(f"{OLLAMA_URL}/api/chat", timeout=600, json={
+        "model": LLM_MODEL, "messages": messages, "stream": False, "keep_alive": "15m",
+        "options": _options(max_tokens, 1.1)})
+    r.raise_for_status()
+    return _clean(r.json()["message"]["content"])
 
-    The first characters are held until we know the model did not start a "thought" block
-    (if it did, the answer is regenerated without streaming). A short tail is always held
-    back so that the answer can be cut cleanly if the model starts copying a context passage.
-    """
-    body = {"model": LLM_MODEL, "prompt": gemma_prompt(prompt, ANSWER_PREFILL[lang]), "raw": True,
-            "stream": True, "keep_alive": "15m", "options": _options(max_tokens, repeat_penalty)}
-    buf, sent, checked = "", 0, False
-    with requests.post(f"{OLLAMA_URL}/api/generate", json=body, stream=True, timeout=600) as r:
+
+def _ollama_stream(path, body):
+    with requests.post(f"{OLLAMA_URL}{path}", json=body, stream=True, timeout=600) as r:
         r.raise_for_status()
         for line in r.iter_lines():
             if not line:
                 continue
             part = json.loads(line)
-            buf += part.get("response", "").replace("<end_of_turn>", "")
-            if not checked:
-                if len(buf.strip()) < 12 and not part.get("done"):
+            piece = part.get("response") if path == "/api/generate" else part.get("message", {}).get("content")
+            if piece:
+                yield piece.replace("<end_of_turn>", "")
+            if part.get("done"):
+                return
+
+
+def stream_generate(user_content, prefill="", max_tokens=300, repeat_penalty=1.15):
+    return _ollama_stream("/api/generate", {
+        "model": LLM_MODEL, "prompt": gemma_prompt(user_content, prefill), "raw": True, "stream": True,
+        "keep_alive": "15m", "options": _options(max_tokens, repeat_penalty)})
+
+
+def stream_chat(messages, max_tokens=400):
+    return _ollama_stream("/api/chat", {
+        "model": LLM_MODEL, "messages": messages, "stream": True, "keep_alive": "15m",
+        "options": _options(max_tokens, 1.1)})
+
+
+def shape_stream(pieces, reasoning=False, holdback=12):
+    """Turn a raw token stream into ("reasoning" | "token", text) events.
+
+    - In reasoning mode, the text up to </reasoning> is the model's reasoning.
+    - The first characters of the answer are held until we know it is not a "thought" block
+      (ThinkingLeak is raised so the caller can regenerate).
+    - A short tail is always held back so the answer can be cut cleanly if the model starts
+      copying a context passage ("[2] ...") or the prompt.
+    """
+    buf, sent = "", 0
+    phase = "reasoning" if reasoning else "check"
+    try:
+        for piece in pieces:
+            buf += piece
+            if phase == "reasoning":
+                end = buf.find("</reasoning>")
+                if end < 0:
+                    if len(buf) - holdback > sent:
+                        yield "reasoning", buf[sent:len(buf) - holdback]
+                        sent = len(buf) - holdback
                     continue
-                checked = True
+                if end > sent:
+                    yield "reasoning", buf[sent:end]
+                buf, sent, phase = buf[end + len("</reasoning>"):], 0, "check"
+            if phase == "check":
+                if len(buf.strip()) < 12:
+                    continue
                 if is_thinking(buf):
-                    break
-                buf = buf.lstrip()
+                    raise ThinkingLeak()
+                buf, sent, phase = buf.lstrip(), 0, "answer"
             m = TRUNCATE_RE.search(buf)
             if m:
                 buf = buf[:m.start()]
                 break
-            if part.get("done"):
-                break
             if len(buf) - holdback > sent:
-                yield buf[sent:len(buf) - holdback]
+                yield "token", buf[sent:len(buf) - holdback]
                 sent = len(buf) - holdback
-    if checked and not is_thinking(buf):
-        final = buf.rstrip()
-        if len(final) > sent:
-            yield final[sent:]
+    finally:
+        pieces.close()
+    if phase == "reasoning":
+        if len(buf) > sent:
+            yield "reasoning", buf[sent:]
         return
-    # Thought block detected: regenerate once without streaming.
-    text = generate(prompt + NO_REASONING, max_tokens, ANSWER_PREFILL[lang], repeat_penalty)
-    m = TRUNCATE_RE.search(text)
-    yield text[:m.start()].strip() if m else text
+    if phase == "check":
+        if is_thinking(buf):
+            raise ThinkingLeak()
+        buf, sent = buf.strip(), 0
+    final = buf.rstrip()
+    if len(final) > sent:
+        yield "token", final[sent:]
 
 
 def ollama_status():
@@ -287,19 +344,19 @@ def classify_intent(question):
 TRIAGE_PROMPT = '''Classify the user message into exactly one category:
 EMERGENCY: describes symptoms or a situation that may need urgent medical help right now (for example sudden weakness or numbness, collapse or unresponsiveness, severe breathing difficulty, chest pain, heavy bleeding, poisoning or overdose, suicidal thoughts).
 MEDICAL: a question about health, diseases, symptoms, medicines, tests or treatments that is not an emergency.
-OTHER: anything not related to health or medicine.
+CHAT: a greeting, thanks, small talk, a question about the assistant itself, or a general question that is not about health (for example arithmetic, a definition, a recipe, the weather).
 
 Message: {question}
-Category (EMERGENCY, MEDICAL or OTHER):'''
+Category (EMERGENCY, MEDICAL or CHAT):'''
 
 
 def llm_triage(question):
     out = generate(TRIAGE_PROMPT.format(question=question), max_tokens=6, prefill="Category:").upper()
-    m = re.search(r"EMERGENCY|MEDICAL|OTHER", out)
+    m = re.search(r"EMERGENCY|MEDICAL|CHAT", out)
     return m.group(0) if m else "MEDICAL"
 
 
-def route(question):
+def route(question, has_files=False, has_images=False):
     lang, intent = detect_lang(question), classify_intent(question)
     r = {"lang": lang, "intent": intent, "triage": None}
     if intent == "emergency":
@@ -307,14 +364,18 @@ def route(question):
     r["triage"] = llm_triage(question)
     if r["triage"] == "EMERGENCY":
         return {**r, "category": "emergency"}
-    if r["triage"] == "OTHER":
-        return {**r, "category": "out_of_scope"}
+    if has_images:
+        return {**r, "category": "image"}
+    if r["triage"] == "CHAT" and not has_files:
+        return {**r, "category": "chat"}
     return {**r, "category": intent if intent in CAUTION_NOTE else "answered"}
 
 
 # ---------------------------------------------------------------- chatbot
 
 LANG_NAME = {"fr": "in French", "en": "in English"}
+TRIAGE_LABEL = {"EMERGENCY": "Possible emergency", "MEDICAL": "Health question", "CHAT": "General message, not a health question"}
+
 RELEVANCE_PROMPT = '''Passages:
 {context}
 
@@ -328,6 +389,7 @@ NOT_FOUND_MSG = {
 }
 
 TRANSLATE_PROMPT = "Translate the following question into English. Output only the English translation, nothing else.\n\n{question}"
+
 RAG_PROMPT = '''You are a careful medical information assistant. You are NOT a doctor.
 Rules:
 - Answer ONLY with information found in the CONTEXT. If the context does not contain the answer, say clearly that you do not know.
@@ -335,46 +397,162 @@ Rules:
 - After EVERY sentence, cite the passage it comes from with its number in brackets, for example: "Metformin can cause nausea [1]."
 - Never give a diagnosis. Never prescribe, dose or change a treatment; advise consulting a health professional instead.
 - Write {lang_name}, for a non-expert reader: a SHORT answer of 3 to 5 sentences in your own words. Summarise; never copy the passages.
-
+{file_rule}{reasoning_rule}
 CONTEXT:
 {context}
 
 QUESTION: {question}
-ANSWER (3 to 5 short sentences, each ending with its citation [n]):'''
+{answer_label}'''
+
+REASONING_RULE = ("- First think step by step inside <reasoning>...</reasoning> (3 to 6 short lines, in English): "
+                  "what the question asks, which passages are relevant and what they say. Then write the final answer.\n")
+
+CHAT_PROMPT = '''You are MedRAG, a friendly medical information assistant that runs locally on the user's computer.
+The user's message is not a health question. Reply {lang_name}, in one to three sentences:
+- greeting, thanks or small talk: reply warmly and offer help with health questions;
+- a question about you: say that you answer health questions from PubMed and NIH sources, and can read photos and documents;
+- a general question (arithmetic, a definition, a fact): answer it briefly and correctly, then say in a few words that you are mainly here for health questions.
+Never give medical advice in this reply.
+{history}
+User: {question}'''
+
+IMAGE_PROMPT = '''You are MedRAG, a careful medical information assistant. The user shared an image with this message: "{question}"
+Describe what you can see that is relevant, in plain words, then give general information about it. Never give a diagnosis: say that only a health professional can interpret the image after an examination. Reply {lang_name}, in at most 6 sentences.'''
+
+IMAGE_NOTE = {"fr": "L'analyse d'image est expérimentale et ne constitue pas un diagnostic.",
+              "en": "Image analysis is experimental and is not a diagnosis."}
 
 
-def chat_events(question, retriever):
+def step(label, detail=""):
+    return {"type": "step", "label": label, "detail": detail}
+
+
+def _answer(pieces, fallback, reasoning=False):
+    """Stream an answer; if the model only produced a thought block, fall back to a non-streamed call."""
+    produced = False
+    try:
+        for kind, text in shape_stream(pieces, reasoning):
+            produced = produced or kind == "token"
+            yield {"type": kind, "text": text}
+    except ThinkingLeak:
+        pass
+    if not produced:
+        text = fallback()
+        m = TRUNCATE_RE.search(text)
+        yield {"type": "token", "text": text[:m.start()].strip() if m else text}
+
+
+def _history_text(history):
+    lines = []
+    for h in list(history)[-6:]:
+        who = "User" if h.get("role") == "user" else "MedRAG"
+        lines.append(f"{who}: {str(h.get('content', ''))[:300]}")
+    return ("Conversation so far:\n" + "\n".join(lines) + "\n") if lines else ""
+
+
+def extract_text(name, data_b64):
+    raw = base64.b64decode(data_b64)
+    if name.lower().endswith(".pdf"):
+        reader = pypdf.PdfReader(io.BytesIO(raw))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages[:50])
+    else:
+        text = raw.decode("utf-8", errors="ignore")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+FILE_QUESTION_RE = re.compile(
+    r"\b(my|this|the|attached) (file|document|report|pdf|results?)\b|\b(mon|ce|le|du|ma|cette) (fichier|document|rapport|pdf|r\u00e9sultats?|bilan|analyse)\b",
+    re.IGNORECASE)
+FILE_RULE = ("- Passages labelled \"Your file\" come from a document the user attached. When the question is about that document, "
+             "answer from those passages first.\n")
+
+
+def search_file(retriever, text, question, k=4):
+    chunks = chunk_text(text, 150, 30)[:400]
+    if not chunks or not chunks[0]:
+        return 0, []
+    emb = retriever.encode_passages(chunks)
+    scores = emb @ retriever.encode_query(question)[0]
+    best = np.argsort(-scores)[:k]
+    return len(chunks), [(chunks[i], float(scores[i])) for i in best]
+
+
+def chat_events(retriever, message, history=(), images=(), files=(), show_reasoning=False, top_k=TOP_K):
     """Yield the chatbot's answer as a sequence of events (dicts) for the streaming API."""
     t0 = time.time()
-    r = route(question)
-    lang = r["lang"]
+    question = message.strip() or ("Décris cette image." if images else "")
+    r = route(question, has_files=bool(files), has_images=bool(images))
+    lang, cat = r["lang"], r["category"]
     yield {"type": "meta", **r}
+    yield step("Safety rules", "Emergency keywords found" if r["intent"] == "emergency" else "No emergency keywords")
+    if r["triage"]:
+        yield step("Triage by MedGemma", TRIAGE_LABEL[r["triage"]])
 
-    if r["category"] == "emergency":
+    if cat == "emergency":
         yield {"type": "token", "text": EMERGENCY_MSG[lang]}
-    elif r["category"] == "out_of_scope":
-        yield {"type": "token", "text": OUT_OF_SCOPE_MSG[lang]}
+
+    elif cat == "chat":
+        prompt = CHAT_PROMPT.format(lang_name=LANG_NAME[lang], history=_history_text(history), question=question)
+        yield from _answer(stream_generate(prompt, ANSWER_PREFILL[lang], max_tokens=160),
+                           lambda: generate(prompt, 160, ANSWER_PREFILL[lang], 1.15))
+
+    elif cat == "image":
+        yield step("Image analysis", f"{len(images)} image(s) sent to MedGemma's vision encoder")
+        msg = {"role": "user", "content": IMAGE_PROMPT.format(question=question, lang_name=LANG_NAME[lang]),
+               "images": list(images)}
+        yield from _answer(stream_chat([msg]),
+                           lambda: chat_once([{**msg, "content": msg["content"] + NO_REASONING}]))
+        yield {"type": "caution", "text": IMAGE_NOTE[lang]}
+
     else:
-        query = question if lang == "en" else generate(TRANSLATE_PROMPT.format(question=question), max_tokens=100).strip('"')
-        hits = retriever.search(query)
         sources = []
-        for n, (i, score) in enumerate(hits, 1):
+        for f in files:
+            try:
+                text = extract_text(f["name"], f["data"])
+            except Exception as e:
+                yield step("Could not read a file", f"{f['name']}: {e}")
+                continue
+            n_chunks, hits = search_file(retriever, text, question)
+            yield step("Read your file", f"{f['name']}: {len(text.split()):,} words, {n_chunks} passages")
+            for chunk, score in hits:
+                sources.append({"title": f["name"], "source": "Your file", "url": None, "score": round(score, 3), "text": chunk})
+
+        about_file = bool(files) and bool(FILE_QUESTION_RE.search(question))
+        query = question
+        if about_file:
+            yield step("Question about your file", "Only your file's passages are used")
+        elif lang != "en":
+            query = generate(TRANSLATE_PROMPT.format(question=question), max_tokens=100).strip('"')
+            yield step("Translated for the search", query)
+        for i, score in ([] if about_file else retriever.search(query, k=min(top_k, 2) if files else top_k)):
             ch = retriever.chunks.iloc[i]
             url = ch["url"] if isinstance(ch["url"], str) else None   # MedQuAD rows have no URL (NaN after the cache)
-            sources.append({"n": n, "title": ch["title"], "source": ch["source"], "url": url,
-                            "chunk_id": ch["chunk_id"], "score": round(score, 3), "text": ch["text"]})
-        yield {"type": "sources", "query": query, "sources": sources}
+            sources.append({"title": ch["title"], "source": ch["source"], "url": url, "score": round(score, 3), "text": ch["text"]})
+        for n, s in enumerate(sources, 1):
+            s["n"] = n
+        if not about_file:
+            best = max((s["score"] for s in sources if s["source"] != "Your file"), default=0)
+            yield step("Searched the knowledge base", f"{len(retriever.chunks):,} passages from PubMed and NIH, best match {best:.2f}")
+
         context = "\n\n".join(f"[{s['n']}] ({s['source']}) {s['text']}" for s in sources)
-        # Relevance check: never answer from the model's memory with citations that do not support it.
-        relevant = generate(RELEVANCE_PROMPT.format(context=context, question=query), max_tokens=4, prefill="Answer:")
-        if "NO" in relevant.upper() and "YES" not in relevant.upper():
-            yield {"type": "sources", "query": query, "sources": []}
+        verdict = generate(RELEVANCE_PROMPT.format(context=context, question=query), max_tokens=4, prefill="Answer:").upper()
+        relevant = not ("NO" in verdict and "YES" not in verdict)
+        yield step("Relevance check", "The passages answer the question" if relevant else "No passage answers the question")
+
+        if not relevant:
             yield {"type": "token", "text": NOT_FOUND_MSG[lang]}
         else:
-            prompt = RAG_PROMPT.format(lang_name=LANG_NAME[lang], context=context, question=question)
-            for piece in stream_answer(prompt, lang):
-                yield {"type": "token", "text": piece}
-        if r["category"] in CAUTION_NOTE:
-            yield {"type": "caution", "text": CAUTION_NOTE[r["category"]][lang]}
+            yield {"type": "sources", "query": query, "sources": sources}
+            prompt = RAG_PROMPT.format(
+                lang_name=LANG_NAME[lang], context=context, question=question,
+                file_rule=FILE_RULE if files else "",
+                reasoning_rule=REASONING_RULE if show_reasoning else "",
+                answer_label="" if show_reasoning else "ANSWER (3 to 5 short sentences, each ending with its citation [n]):")
+            prefill = REASONING_PREFILL if show_reasoning else ANSWER_PREFILL[lang]
+            yield from _answer(stream_generate(prompt, prefill, max_tokens=550 if show_reasoning else 300),
+                               lambda: generate(prompt + NO_REASONING, 300, ANSWER_PREFILL[lang], 1.15),
+                               reasoning=show_reasoning)
+        if cat in CAUTION_NOTE:
+            yield {"type": "caution", "text": CAUTION_NOTE[cat][lang]}
 
     yield {"type": "done", "disclaimer": DISCLAIMER[lang], "latency_s": round(time.time() - t0, 1)}
