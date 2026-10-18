@@ -77,12 +77,30 @@ medical_chatbot("Comment se transmet la maladie de Lyme ?", retriever, method="d
 
 ## Chat interface
 
-A web app in the style of ChatGPT or Claude: streamed answers, clickable `[n]` citations, a sources panel with links to PubMed, conversation history, light and dark themes, and a mobile layout.
+MedRAG ships with a web app in the style of ChatGPT or Claude. Everything runs on your computer: the model, the search and your conversations.
 
-| Folder | Content |
+![MedRAG chat: a question about glaucoma with its process steps and cited NIH sources](docs/screenshots/chat-light.png)
+
+| Dark theme | Emergency message | Mobile |
+| --- | --- | --- |
+| ![Dark theme](docs/screenshots/chat-dark.png) | ![Emergency redirection](docs/screenshots/emergency.png) | ![Mobile layout](docs/screenshots/mobile.png) |
+
+### Features
+
+| Area | What you can do |
 | --- | --- |
-| `backend/` | FastAPI server (`app.py`) and the notebook's final pipeline as a module (`rag.py`): rules + LLM triage, translation, dense search, a relevance check, MedGemma streaming |
-| `frontend/` | React + Vite interface |
+| **Answers** | Answers stream word by word, in English or French, with clickable `[n]` citations that open the matching source (PubMed abstracts link to PubMed) |
+| **Visible reasoning** | A **Process** panel shows each step: safety rules, triage, translation, search, relevance check. Turn on *Show the model's reasoning* in Settings to also see MedGemma think step by step before it answers |
+| **Photos** | Add up to 3 images (button, drag and drop, or paste). MedGemma describes them through its vision encoder and never diagnoses |
+| **Documents** | Add PDF, TXT or MD files. They are read and searched on the fly, and their passages are cited as "Your file" |
+| **Conversation** | Greetings and simple general questions (for example "hello" or "2+2") get a short friendly reply; health questions go through RAG; emergencies are redirected to emergency services without any generated advice |
+| **Chats** | History saved in your browser, search, rename, delete, export to Markdown, regenerate the last answer, stop an answer (Esc) |
+| **Layout** | Collapsible side panel (Ctrl/Cmd+B), light, dark or system theme, mobile layout |
+| **Settings** | Theme, model reasoning on or off, number of sources per answer (1 to 5), delete all conversations, keyboard shortcuts |
+
+![Settings](docs/screenshots/settings.png)
+
+### Run it
 
 Start everything with one command (Ollama, backend on port 8000, interface on port 5180):
 
@@ -92,11 +110,22 @@ Start everything with one command (Ollama, backend on port 8000, interface on po
 
 Then open <http://localhost:5180>. The first start downloads the data and builds the index (about 4 minutes); it is then cached in `backend/cache/`.
 
-The app differs from the notebook's evaluated configuration in three ways, all aimed at real use:
+| Folder | Content |
+| --- | --- |
+| `backend/` | FastAPI server (`app.py`) and the pipeline as a module (`rag.py`): rules and LLM triage, translation, dense search, relevance check, streaming, images and file reading |
+| `frontend/` | React + Vite interface |
+| `docs/screenshots/` | The images above |
 
-- it indexes **all 13,971 MedQuAD answers** (24,927 chunks) instead of the 3,000-answer evaluation sample, so common topics such as Lyme disease are covered;
-- it runs a **relevance check** before answering: if the retrieved passages do not answer the question, it says so instead of answering from the model's memory;
-- the answer prompt asks for **3 to 5 sentences in the model's own words**, which cut copying of passages and halved latency (about 5 to 12 s per answer on an Apple M4).
+### How the app differs from the evaluated notebook
+
+The notebook measures one fixed configuration. The app changes four things for real use:
+
+- it indexes **all 13,971 MedQuAD answers** (24,927 passages) instead of the 3,000-answer evaluation sample, so common topics such as Lyme disease are covered;
+- it runs a **relevance check** before answering: if the retrieved passages do not answer the question, it says so instead of answering from the model's memory with misleading citations;
+- the answer prompt asks for **3 to 5 sentences in the model's own words**, which reduced copying of passages and brought answers down to about 5 to 12 s on an Apple M4;
+- triage has a **CHAT** class, so greetings and simple general questions are answered briefly instead of refused.
+
+These changes were checked by hand on a few questions but are not part of the notebook's evaluation.
 
 ## Limitations
 
@@ -104,11 +133,14 @@ The app differs from the notebook's evaluated configuration in three ways, all a
 - Small evaluation samples, and no review by health professionals.
 - The model sometimes merges passages, adds uncited claims or copies the context; one stroke warning case was missed by the guardrails.
 - Latency was measured on an Apple M4 only (8 to 16 s per answer); it will be slower on a PC without a GPU.
+- Image descriptions from a 4B model can be partly wrong; image analysis is experimental and never a diagnosis.
+- Citations are often incomplete: the model sometimes cites only one passage for a whole answer.
 
 ## Roadmap
 
 - [x] FastAPI backend with a streaming `/chat` route
 - [x] React front end showing cited sources and the disclaimer
+- [x] Photo and document upload, visible reasoning, themes and settings
 - [ ] French and drug-information sources
 - [ ] Recall-oriented emergency classifier
 - [ ] Phase 2: QLoRA fine-tuning of the answer format (skeleton already in the notebook, section 9.3)
