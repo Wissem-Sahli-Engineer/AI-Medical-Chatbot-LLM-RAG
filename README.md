@@ -75,6 +75,29 @@ To try the chatbot only, run the cells up to section 5.6, build the retriever, t
 medical_chatbot("Comment se transmet la maladie de Lyme ?", retriever, method="dense")
 ```
 
+## Chat interface
+
+A web app in the style of ChatGPT or Claude: streamed answers, clickable `[n]` citations, a sources panel with links to PubMed, conversation history, light and dark themes, and a mobile layout.
+
+| Folder | Content |
+| --- | --- |
+| `backend/` | FastAPI server (`app.py`) and the notebook's final pipeline as a module (`rag.py`): rules + LLM triage, translation, dense search, a relevance check, MedGemma streaming |
+| `frontend/` | React + Vite interface |
+
+Start everything with one command (Ollama, backend on port 8000, interface on port 5180):
+
+```bash
+./start.sh
+```
+
+Then open <http://localhost:5180>. The first start downloads the data and builds the index (about 4 minutes); it is then cached in `backend/cache/`.
+
+The app differs from the notebook's evaluated configuration in three ways, all aimed at real use:
+
+- it indexes **all 13,971 MedQuAD answers** (24,927 chunks) instead of the 3,000-answer evaluation sample, so common topics such as Lyme disease are covered;
+- it runs a **relevance check** before answering: if the retrieved passages do not answer the question, it says so instead of answering from the model's memory;
+- the answer prompt asks for **3 to 5 sentences in the model's own words**, which cut copying of passages and halved latency (about 5 to 12 s per answer on an Apple M4).
+
 ## Limitations
 
 - English-only corpus; MedQuAD contains no drug leaflets, so the chatbot cannot answer reliably about medicines.
@@ -84,8 +107,8 @@ medical_chatbot("Comment se transmet la maladie de Lyme ?", retriever, method="d
 
 ## Roadmap
 
-- [ ] FastAPI backend with a streaming `/chat` route
-- [ ] React front end showing cited sources and the disclaimer
+- [x] FastAPI backend with a streaming `/chat` route
+- [x] React front end showing cited sources and the disclaimer
 - [ ] French and drug-information sources
 - [ ] Recall-oriented emergency classifier
 - [ ] Phase 2: QLoRA fine-tuning of the answer format (skeleton already in the notebook, section 9.3)

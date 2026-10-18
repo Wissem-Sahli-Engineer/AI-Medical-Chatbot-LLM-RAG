@@ -12,3 +12,7 @@ rank_bm25
 ipykernel
 nbformat
 nbclient
+
+# Interface
+fastapi
+uvicorn[standard]
